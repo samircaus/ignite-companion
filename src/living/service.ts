@@ -8,7 +8,7 @@ import { runCommand, type CommandRunner } from "../ignite/writer.js";
 import { fontSafe, type Interpretation, type Interpreter } from "./interpreter.js";
 import { bbox, contextBox, findMarks, grow, union, type Box, type CommandMark, type Glyph, type MarkStroke } from "./marks.js";
 import { LivingMemory } from "./memory.js";
-import { PAGE_W, placeAnswer, toUnits, WRITING_SIZE, type Measure, type Placement } from "./planner.js";
+import { ackSpec, PAGE_W, placeAnswer, toUnits, WRITING_SIZE, type Measure, type Placement } from "./planner.js";
 
 /**
  * Living Notebooks: AI answers written into Kindle pages as ink.
@@ -72,7 +72,8 @@ export interface PageEditPlan {
 
 interface StoredPlan extends PageEditPlan { specPath: string; dir: string; text: string; hasDrawing: boolean }
 
-interface State { v: 1; cursor: number | null; consumed: string[]; turns: AiTurn[] }
+/** `acks`: ink ids of "working" dots on a page right now (removed when the answer is written). */
+interface State { v: 1; cursor: number | null; consumed: string[]; turns: AiTurn[]; acks: string[] }
 
 export interface LivingStatus {
   enabled: true;
@@ -147,7 +148,9 @@ export class LivingService {
   async start(): Promise<void> {
     await mkdir(this.options.stateDir, { recursive: true });
     await this.memory.ensureDefaults();
-    await this.#load();
+    const state = await this.#load();
+    // Dots left by a turn that never finished (service stopped mid-turn).
+    if (state.acks.length) await this.#serial(() => this.#clearAck([...state.acks]));
   }
 
   // ------------------------------------------------------------------ state
@@ -156,9 +159,9 @@ export class LivingService {
     if (this.#state) return this.#state;
     try {
       const parsed = JSON.parse(await readFile(this.#statePath, "utf8")) as State;
-      this.#state = { v: 1, cursor: parsed.cursor ?? null, consumed: parsed.consumed ?? [], turns: parsed.turns ?? [] };
+      this.#state = { v: 1, cursor: parsed.cursor ?? null, consumed: parsed.consumed ?? [], turns: parsed.turns ?? [], acks: parsed.acks ?? [] };
     } catch {
-      this.#state = { v: 1, cursor: null, consumed: [], turns: [] };
+      this.#state = { v: 1, cursor: null, consumed: [], turns: [], acks: [] };
     }
     return this.#state;
   }
@@ -187,7 +190,8 @@ export class LivingService {
 
   /** Stroke ids of every AI turn still on the page (for transcription exclusion and the watcher). */
   async aiStrokeIds(): Promise<Set<string>> {
-    return new Set((await this.#load()).turns.filter((t) => t.status === "applied").flatMap((t) => t.strokeIds));
+    const state = await this.#load();
+    return new Set([...state.turns.filter((t) => t.status !== "undone").flatMap((t) => t.strokeIds), ...state.acks]);
   }
 
   async replicaId(): Promise<string | null> {
@@ -394,8 +398,8 @@ export class LivingService {
       const state = await this.#load();
       const turn = state.turns.find((t) => t.turnId === turnId);
       if (!turn) throw new LivingError(404, `No AI turn ${turnId}`);
-      if (turn.status !== "applied") throw new LivingError(409, `Turn ${turnId} is ${turn.status}; nothing to undo`);
       const ids = [...turn.strokeIds, ...turn.textIds];
+      if (turn.status === "undone" || !ids.length) throw new LivingError(409, `Turn ${turnId} is ${turn.status}; nothing to undo`);
       if (ids.length) await this.#import(["delete-ink", ...ids, ...this.#base(), "--confirm-write"], 300_000);
       turn.status = "undone";
       await this.#save();
@@ -475,6 +479,8 @@ export class LivingService {
       const dir = path.join(this.options.stateDir, "turns", `${this.#now().toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`);
       await mkdir(dir, { recursive: true });
       let interpretation: Interpretation | undefined;
+      // Quick "seen, working on it" dots next to the mark, before the slow part.
+      let ack = await this.#acknowledge(ref, mark, dir);
       try {
         const markIds = new Set(mark.ids);
         const about = contextBox(mark, page, markIds);
@@ -493,6 +499,9 @@ export class LivingService {
           memory: memory.memory, summary: memory.summary, lineChars: 34
         });
         const text = interpretation.needsConfirmation ? `? ${interpretation.answer}` : interpretation.answer;
+        // Dots out first: removal and answer reach the Kindle together, usually in one refresh.
+        await this.#clearAck(ack);
+        ack = [];
         // Place against the page as it is now (the user may have kept writing).
         const now = await this.findPage({ pageId: ref.page.page_id }, 0);
         const ink = { strokes: pts(now.page), texts: now.page.texts ?? [] };
@@ -522,7 +531,9 @@ export class LivingService {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.#lastError = message.slice(0, 300);
-        const turn = this.#turn({ source: "pen", ref, report: null, placement: null, answer: interpretation?.answer ?? "", hasDrawing: false, glyph: mark.glyph, markIds: mark.ids, understood: interpretation?.understood ?? "", question: false, durationMs: Date.now() - started, error: message.slice(0, 500) });
+        await this.#clearAck(ack);
+        const failedNote = await this.#failedNote(ref, mark, dir);
+        const turn = this.#turn({ source: "pen", ref, report: failedNote, placement: null, answer: interpretation?.answer ?? "", hasDrawing: false, glyph: mark.glyph, markIds: mark.ids, understood: interpretation?.understood ?? "", question: false, durationMs: Date.now() - started, error: message.slice(0, 500) });
         await this.#record(turn);
         this.options.log?.({ event: "living_turn_failed", page: ref.page.page_id, error: message.slice(0, 300) });
         return turn;
@@ -530,6 +541,55 @@ export class LivingService {
         this.#busy = null;
       }
     });
+  }
+
+  // ------------------------------------------------------------------ acknowledgement
+
+  /** Writes the "working" dots beside `mark`; returns their ink ids ([] if that failed). */
+  async #acknowledge(ref: PageRef, mark: CommandMark, dir: string): Promise<string[]> {
+    try {
+      const ackDir = path.join(dir, "ack");
+      await mkdir(ackDir, { recursive: true });
+      const { spec } = ackSpec({ strokes: pts(ref.page), texts: ref.page.texts ?? [] }, mark.box, "working");
+      const report = await this.#annotate(ref, spec, ackDir, true);
+      const ids = [...(report.strokeIds ?? []), ...(report.textIds ?? [])];
+      if (ids.length) {
+        (await this.#load()).acks.push(...ids);
+        await this.#save();
+      }
+      this.options.log?.({ event: "living_ack", page: ref.page.page_id, strokes: ids.length });
+      return ids;
+    } catch (error) {
+      this.options.log?.({ event: "living_ack_failed", error: error instanceof Error ? error.message.slice(0, 300) : String(error) });
+      return [];
+    }
+  }
+
+  /** Removes acknowledgement dots (best effort: the user may already have erased them). */
+  async #clearAck(ids: string[]): Promise<void> {
+    if (!ids.length) return;
+    try {
+      await this.#import(["delete-ink", ...ids, ...this.#base(), "--confirm-write"], 120_000);
+    } catch (error) {
+      this.options.log?.({ event: "living_ack_clear_failed", error: error instanceof Error ? error.message.slice(0, 300) : String(error) });
+    }
+    const state = await this.#load();
+    state.acks = state.acks.filter((id) => !ids.includes(id));
+    await this.#save();
+  }
+
+  /** Writes "failed" beside the mark so a turn that went wrong is visible on the Kindle. */
+  async #failedNote(ref: PageRef, mark: CommandMark, dir: string): Promise<ImportReport | null> {
+    try {
+      const now = await this.findPage({ pageId: ref.page.page_id }, 0);
+      const noteDir = path.join(dir, "failed");
+      await mkdir(noteDir, { recursive: true });
+      const { spec } = ackSpec({ strokes: pts(now.page), texts: now.page.texts ?? [] }, mark.box, "failed");
+      return await this.#annotate(now, spec, noteDir, true);
+    } catch (error) {
+      this.options.log?.({ event: "living_failed_note_failed", error: error instanceof Error ? error.message.slice(0, 300) : String(error) });
+      return null;
+    }
   }
 
   // ------------------------------------------------------------------ helpers

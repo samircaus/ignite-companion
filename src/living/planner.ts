@@ -205,6 +205,40 @@ export async function placeAnswer(input: {
   };
 }
 
+/** Three small dots (two rings each, so they read as dots with the thin pen): "seen, working on it". */
+export const ACK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 12">${[6, 30, 54].map((cx) => `<circle cx="${cx}" cy="6" r="4" fill="none" stroke="black"/><circle cx="${cx}" cy="6" r="1.8" fill="none" stroke="black"/>`).join("")}</svg>`;
+const ACK_W = 0.06;
+const ACK_H = ACK_W * (12 / 60);
+const FAILED_W = 0.13;
+const FAILED_H = WRITING_SIZE * 1.6;
+const ACK_GAP = 0.015;
+
+/**
+ * Where the quick acknowledgement goes, as an `ignite-import annotate` spec: `working` is three
+ * dots, `failed` is the word "failed". Beside the mark (right, then left, below, above), in the
+ * first spot with no ink; right of the mark when none is free. Small and temporary, so it does
+ * not take part in placing the answer.
+ */
+export function ackSpec(ink: PageInk, anchor: Box, kind: "working" | "failed"): { spec: Record<string, unknown>; box: Placement["box"] } {
+  const m = toUnits(anchor);
+  const [w, h] = kind === "working" ? [ACK_W, ACK_H] : [FAILED_W, FAILED_H];
+  const midY = (m.y0 + m.y1) / 2 - h / 2;
+  const candidates: [number, number][] = [
+    [m.x1 + ACK_GAP, midY],
+    [m.x0 - ACK_GAP - w, midY],
+    [m.x0, m.y1 + ACK_GAP],
+    [m.x0, m.y0 - ACK_GAP - h]
+  ];
+  const fits = ([x, y]: [number, number]) => x >= MARGIN_X / 2 && x + w <= 1 - MARGIN_X / 2 && y >= SAFE_TOP && y + h <= SAFE_BOTTOM;
+  const grid = occupancy(ink);
+  const clamp = ([x, y]: [number, number]): [number, number] => [Math.min(Math.max(x, MARGIN_X / 2), 1 - MARGIN_X / 2 - w), Math.min(Math.max(y, SAFE_TOP), SAFE_BOTTOM - h)];
+  const [x, y] = candidates.find((c) => fits(c) && grid.free(c[0], c[1], w, h)) ?? clamp(candidates.find(fits) ?? candidates[0]!);
+  const spec = kind === "working"
+    ? { drawings: [{ svg: ACK_SVG, x: round(x), y: round(y), width: ACK_W }] }
+    : { writing: [{ text: "failed", x: round(x), y: round(y), width: FAILED_W }] };
+  return { spec, box: { x, y, w, h } };
+}
+
 /** Bounding box (canonical) of a set of strokes, or null. */
 export function inkBox(strokes: { points: readonly Point[] }[]): Box | null {
   const boxes = strokes.filter((s) => s.points.length).map((s) => bbox(s.points));

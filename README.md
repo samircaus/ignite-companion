@@ -11,6 +11,8 @@ to Ignite's sync server and:
   folders, and push PDFs or EPUBs over Wi-Fi.
 - **Lets an AI answer in your notebooks (Living Notebooks).** Draw a small circled `?` or `+` on a
   page, and the answer is written next to it in handwriting ink, which you can erase on the Kindle.
+  Three small dots appear beside your mark within seconds, so you know it was seen; they make way
+  for the answer, or for the word "failed" if the AI could not answer.
   Each notebook has its memory and instructions in plain Markdown under `Living Notebooks/`.
 - **Exposes all of it as an MCP server**, so Claude, Codex or any MCP client can read your pages
   and propose edits.
