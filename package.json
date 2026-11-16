@@ -1,0 +1,36 @@
+{
+  "name": "ignite-companion",
+  "version": "0.1.0",
+  "description": "Mac companion for Ignite on the Kindle Scribe: mirror notebooks to Markdown, send notes back, and let an AI answer in your notebooks.",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "ignite-companion": "dist/server.js",
+    "ignite-companion-mcp": "dist/mcp/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:native": "./scripts/build-native.sh",
+    "start": "node dist/server.js",
+    "mcp": "node dist/mcp/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "6.0.3",
+    "vitest": "^5.0.1"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "os": [
+    "darwin"
+  ]
+}
